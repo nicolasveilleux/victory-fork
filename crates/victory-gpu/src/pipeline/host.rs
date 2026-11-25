@@ -9,6 +9,7 @@ use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
 use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::{ResourceType, RootType, UsedResource};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -279,9 +280,71 @@ pub(crate) fn bounded_root_srvs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_SRV_DIRECT").is_none())
 }
 
+/// Immutable descriptor-table layout of a translated stage. Live descriptor
+/// contents and root constants are still resolved on each draw.
+pub(crate) struct TableLayout {
+    pub(crate) slot: u8,
+    /// Shader order matters when preparing reads on a cache hit.
+    pub(crate) entries: Vec<UsedResource>,
+    /// The first declared resource for each 32-byte record, in record order.
+    pub(crate) records: Vec<(u32, ResourceType)>,
+}
+
+impl TableLayout {
+    fn build(used: &[UsedResource]) -> Vec<Self> {
+        let mut by_slot = std::collections::BTreeMap::<u8, Vec<UsedResource>>::new();
+        for &entry in used.iter().filter(|u| u.root == RootType::Table) {
+            by_slot.entry(entry.slot).or_default().push(entry);
+        }
+        by_slot
+            .into_iter()
+            .map(|(slot, entries)| {
+                let mut records: Vec<_> = entries
+                    .iter()
+                    .map(|u| (u.table_offset_dwords / 8, u.kind))
+                    .collect();
+                // Stable sort and keep the first match, just as the draw's
+                // linear search did for aliases within a record.
+                records.sort_by_key(|&(record, _)| record);
+                records.dedup_by_key(|entry| entry.0);
+                Self { slot, entries, records }
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn table_layout_preserves_shader_order_and_first_record_alias() {
+    let entry = |slot, table_offset_dwords, kind, root| UsedResource {
+        kind,
+        root,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 8,
+        user_data: 0,
+        slot,
+    };
+    let used = [
+        entry(9, 35, ResourceType::Srv, RootType::Table),
+        entry(2, 8, ResourceType::Sampler, RootType::Table),
+        entry(9, 0, ResourceType::Cbv, RootType::Table),
+        entry(9, 32, ResourceType::Uav, RootType::Table),
+        entry(9, 160, ResourceType::Srv, RootType::Constants),
+    ];
+    let layouts = TableLayout::build(&used);
+    assert_eq!(layouts.len(), 2);
+    assert_eq!(layouts[0].slot, 2);
+    assert_eq!(layouts[1].slot, 9);
+    assert_eq!(layouts[1].entries, [used[0], used[2], used[3]]);
+    assert_eq!(layouts[1].records, [(0, ResourceType::Cbv), (4, ResourceType::Srv)]);
+    assert!(TableLayout::build(&used[4..]).is_empty());
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
+    pub(crate) tables: Vec<TableLayout>,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
     /// Root parameters of its root views: (title root parameter, ours).
@@ -386,9 +449,11 @@ impl HostPipeline {
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+            let translated = shader.translated()?;
+            let t = &translated.host;
             let mut stage = Stage {
                 shader: shader.clone(),
+                tables: TableLayout::build(&translated.used),
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
