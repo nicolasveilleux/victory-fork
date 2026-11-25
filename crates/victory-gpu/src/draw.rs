@@ -516,6 +516,86 @@ pub(crate) fn take_dropped() -> u64 {
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 
+/// Set of title root slots that need fresh descriptor tables. The whole u8
+/// range fits without allocating, and iteration preserves slot order.
+#[derive(Default)]
+struct TableSlots([u64; 4]);
+
+impl TableSlots {
+    fn insert(&mut self, slot: u8) {
+        self.0[usize::from(slot / 64)] |= 1u64 << (slot % 64);
+    }
+
+    fn contains(&self, slot: u8) -> bool {
+        self.0[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0
+    }
+
+    fn ordered(self) -> impl Iterator<Item = u8> {
+        self.0.into_iter().enumerate().flat_map(|(word, mut bits)| {
+            std::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let bit = bits.trailing_zeros();
+                bits &= bits - 1;
+                Some((word * 64 + bit as usize) as u8)
+            })
+        })
+    }
+}
+
+/// Remapped table offsets, with inline room for small sets.
+#[derive(Default)]
+struct MadeTables {
+    inline: [(u8, u32); 8],
+    len: usize,
+    overflow: Vec<(u8, u32)>,
+}
+
+impl MadeTables {
+    fn push(&mut self, entry: (u8, u32)) {
+        if let Some(slot) = self.inline.get_mut(self.len) {
+            *slot = entry;
+            self.len += 1;
+        } else {
+            self.overflow.push(entry);
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &(u8, u32)> {
+        self.inline[..self.len].iter().chain(self.overflow.iter())
+    }
+}
+
+#[test]
+fn fresh_table_offsets_preserve_slots_and_failure_marker() {
+    let mut made = MadeTables::default();
+    assert!(made.iter().next().is_none());
+    for slot in 0..8 {
+        made.push((slot, u32::from(slot) * 32));
+    }
+    assert!(made.overflow.is_empty());
+    made.push((255, u32::MAX));
+    assert_eq!(made.iter().count(), 9);
+    assert_eq!(made.iter().find(|entry| entry.0 == 0), Some(&(0, 0)));
+    assert_eq!(made.iter().last(), Some(&(255, u32::MAX)));
+}
+
+#[test]
+fn fresh_table_slots_preserve_sorted_unique_order() {
+    let mut slots = TableSlots::default();
+    assert_eq!(TableSlots::default().ordered().next(), None);
+    for slot in [255, 128, 63, 64, 0, 127, 191, 192, 63] {
+        slots.insert(slot);
+        assert!(slots.contains(slot));
+    }
+    assert!(!slots.contains(254));
+    assert_eq!(
+        slots.ordered().collect::<Vec<_>>(),
+        [0, 63, 64, 127, 128, 191, 192, 255]
+    );
+}
+
 /// Buffer views of the heap whose slot showed another host buffer than
 /// the copy the pass brought up to date for them, since the start
 /// (diagnostics; for the memory line). It stays 0 while the pass and the
@@ -2651,25 +2731,23 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    pub(crate) fn tables(
+    fn tables(
         &mut self,
         list: &HostList,
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         compute: bool,
-    ) -> Vec<(u8, u32)> {
+    ) -> MadeTables {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        let mut fresh = TableSlots::default();
+        for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
+            fresh.insert(u.slot);
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if fresh.contains(u.slot) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -2683,18 +2761,16 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                fresh.insert(u.slot);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if !fresh.contains(u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
+        let mut made = MadeTables::default();
+        for slot in fresh.ordered() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
