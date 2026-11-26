@@ -293,8 +293,18 @@ fn parallel_scan_on() -> bool {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct PreparedRecord {
     index: u32,
+    header: [u32; 3],
     print: u64,
     empty: bool,
+}
+
+#[cfg(windows)]
+fn record_header(record: &[u8]) -> Option<[u32; 3]> {
+    let header = record.first_chunk::<12>()?;
+    Some(std::array::from_fn(|i| {
+        let at = i * 4;
+        u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]])
+    }))
 }
 
 #[cfg(windows)]
@@ -312,6 +322,7 @@ fn prepare_descriptor_page(
         let record = scratch.get(at..at + step as usize)?;
         Some(PreparedRecord {
             index: index as u32,
+            header: record_header(record)?,
             print: host::record_print(record) | 1,
             empty: record.iter().all(|&b| b == 0),
         })

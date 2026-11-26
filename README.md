@@ -370,6 +370,8 @@ What did it, on top of the list below:
   mirrored before every submission (pull request #305 by Flyander, after
   upstream VIctory 86a5ed6). Measured here: about 40,000 records a frame
   that no call had announced; their host slots were empty or stale.
+  The host slot and its fingerprint use the same captured record, even if
+  the guest slot changes after the page was read.
 - A buffer view that does not start on an element of its buffer's host
   copy gets a copy of its own bytes instead of being refused (after
   upstream 86a5ed6): 3 to 6 such views a frame.
