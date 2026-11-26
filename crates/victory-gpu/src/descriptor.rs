@@ -10,6 +10,8 @@
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
+#[cfg(any(windows, test))]
+mod cold;
 #[cfg(windows)]
 pub(crate) mod host;
 
@@ -1317,7 +1319,8 @@ mod tests {
         let placement = Placement { address: memory as u64, size: size as u64 };
         let mut h: This = std::ptr::null();
         assert_eq!(create(desc, placement, &mut h), S_OK);
-        if let Some(host) = heap(h).host() {
+        {
+            let host = heap(h).host().expect("the timing fixture requires a D3D12 descriptor heap");
             let mut record = [0u64; 4];
             create_srv(std::ptr::null(), std::ptr::null(), std::ptr::null(), record.as_mut_ptr() as u64);
             let indices = |n: usize| (0..n).flat_map(|p| [p * page / 32, (p+1)*page/32-1]);
